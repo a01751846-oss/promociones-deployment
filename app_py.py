@@ -31,44 +31,100 @@ st.markdown("""
 st.markdown('<h1 class="main-header">Dashboard de Impacto Promocional</h1>', unsafe_allow_html=True)
 
 # ==========================================
-# 2. PROCESAMIENTO INTELIGENTE DE DATOS
+# 2. PROCESAMIENTO DE DATOS EN CACHÉ
 # ==========================================
+def leer_archivo(archivo):
+    """Lee archivo CSV o Excel de forma segura y limpia nombres de columnas."""
+    nombre = archivo.name.lower()
+    if nombre.endswith('.csv'):
+        try:
+            df = pd.read_csv(archivo, encoding='utf-8')
+        except UnicodeDecodeError:
+            archivo.seek(0)
+            df = pd.read_csv(archivo, encoding='latin-1')
+    elif nombre.endswith(('.xlsx', '.xls')):
+        df = pd.read_excel(archivo)
+    else:
+        st.error(f"Formato no soportado: {nombre}")
+        st.stop()
+        
+    # Limpiar columnas: minúsculas y sin espacios a los lados
+    df.columns = df.columns.str.lower().str.strip()
+    return df
+
 @st.cache_data
 def load_and_process_data(sales_file, promo_file):
-    
-    # Función que detecta si es Excel o CSV
-    def leer_archivo(archivo):
-        if archivo.name.endswith('.csv'):
-            try:
-                # Intenta UTF-8 estándar
-                return pd.read_csv(archivo, encoding='utf-8')
-            except UnicodeDecodeError:
-                # Si falla, usa Latin-1 (para Excel en español)
-                archivo.seek(0)
-                return pd.read_csv(archivo, encoding='latin-1')
-        else:
-            # Si es .xlsx o .xls
-            return pd.read_excel(archivo)
-
+    # Leer archivos
     df_sales = leer_archivo(sales_file)
     df_promo = leer_archivo(promo_file)
     
+    # ----------------------------------------------------
+    # MAPEO DE COLUMNAS PARA EL ARCHIVO DE VENTAS
+    # ----------------------------------------------------
+    columnas_ventas = {
+        'tran_date': 'fecha',
+        'dept_nm': 'dpto',
+        'subdept_nm': 'subdpto',
+        'prod_nm': 'sku',
+        'qty': 'unidades_vendidas',
+        'precio': 'precio'
+    }
+    
+    # Renombrar columnas si existen
+    df_sales = df_sales.rename(columns=columnas_ventas)
+    
+    # Manejar el costo si no está explícito pero tenemos 'diferencia_precio_costo'
+    if 'costo' not in df_sales.columns and 'diferencia_precio_costo' in df_sales.columns:
+        # Asumimos que precio - costo = diferencia, entonces costo = precio - diferencia
+        df_sales['costo'] = df_sales['precio'] - pd.to_numeric(df_sales['diferencia_precio_costo'], errors='coerce')
+    elif 'costo' not in df_sales.columns and 'cruce_costo' in df_sales.columns:
+        df_sales['costo'] = df_sales['cruce_costo']
+    elif 'costo' not in df_sales.columns:
+        df_sales['costo'] = 0  # Fallback si no hay nada
+        
+    # Mapeo de archivo de promociones (asumiendo que las columnas podrían ser parecidas)
+    # Si la base de promos no trae "fecha" sino "tran_date" o "sku" en vez de "prod_nm"
+    columnas_promo = {
+        'tran_date': 'fecha',
+        'prod_nm': 'sku',
+        'promo': 'promo_activa'
+    }
+    df_promo = df_promo.rename(columns=columnas_promo)
+
+    # Validar que ahora sí existan las obligatorias
+    for col in ['fecha', 'sku']:
+        if col not in df_sales.columns:
+            st.error(f"Error crítico: No se pudo encontrar ni mapear la columna '{col}' en Ventas.")
+            st.stop()
+        if col not in df_promo.columns:
+            st.error(f"Error crítico: No se pudo encontrar ni mapear la columna '{col}' en Promociones.")
+            st.stop()
+            
     # Estandarizar fechas
-    df_sales['fecha'] = pd.to_datetime(df_sales['fecha'])
-    df_promo['fecha'] = pd.to_datetime(df_promo['fecha'])
+    df_sales['fecha'] = pd.to_datetime(df_sales['fecha'], errors='coerce')
+    df_promo['fecha'] = pd.to_datetime(df_promo['fecha'], errors='coerce')
     
-    # Hacer el cruce
-    df = pd.merge(df_sales, df_promo[['fecha', 'sku', 'promo_activa']], on=['fecha', 'sku'], how='left')
+    # Hacer un left join para cruzar ventas con días de promoción
+    # Si en promo no existe 'promo_activa', la creamos
+    if 'promo_activa' not in df_promo.columns:
+        df_promo['promo_activa'] = 1
+        
+    df = pd.merge(df_sales, df_promo[['fecha', 'sku', 'promo_activa']].drop_duplicates(), 
+                  on=['fecha', 'sku'], how='left')
     
-    # Limpiar columnas
+    # Limpiar columnas finales
     df['promo_activa'] = df['promo_activa'].fillna(0).astype(int)
     df['unidades_vendidas'] = pd.to_numeric(df['unidades_vendidas'], errors='coerce').fillna(0)
     df['precio'] = pd.to_numeric(df['precio'], errors='coerce').fillna(0)
     df['costo'] = pd.to_numeric(df['costo'], errors='coerce').fillna(0)
     
-    # Calcular métricas financieras
-    df['ingresos'] = df['unidades_vendidas'] * df['precio']
-    df['ganancias'] = df['unidades_vendidas'] * (df['precio'] - df['costo'])
+    # Usamos net_sale si está disponible, si no lo calculamos
+    if 'net_sale' in df.columns:
+        df['ingresos'] = pd.to_numeric(df['net_sale'], errors='coerce').fillna(0)
+    else:
+        df['ingresos'] = df['unidades_vendidas'] * df['precio']
+        
+    df['ganancias'] = df['ingresos'] - (df['unidades_vendidas'] * df['costo'])
     
     return df
 
@@ -76,18 +132,15 @@ def load_and_process_data(sales_file, promo_file):
 # 3. BARRA LATERAL: CARGA DE ARCHIVOS
 # ==========================================
 st.sidebar.header("📁 Carga de Datos")
-st.sidebar.markdown("*Ahora soporta CSV y Excel (.xlsx)*")
+sales_file = st.sidebar.file_uploader("1. Histórico de Ventas (CSV/Excel)", type=['csv', 'xlsx', 'xls'])
+promo_file = st.sidebar.file_uploader("2. Base de Promociones (CSV/Excel)", type=['csv', 'xlsx', 'xls'])
 
-# Actualizamos los uploaders para que acepten Excel
-sales_csv = st.sidebar.file_uploader("1. Histórico de Ventas", type=['csv', 'xlsx', 'xls'], help="Columnas requeridas: fecha, sku, dpto, subdpto, unidades_vendidas, precio, costo")
-promo_csv = st.sidebar.file_uploader("2. Base de Promociones", type=['csv', 'xlsx', 'xls'], help="Columnas requeridas: fecha, sku, promo_activa")
-
-if not sales_csv or not promo_csv:
+if not sales_file or not promo_file:
     st.info("👋 Por favor, carga ambos archivos en el menú lateral para comenzar.")
     st.stop()
 
 # Cargar el dataframe maestro
-df_trabajo = load_and_process_data(sales_csv, promo_csv)
+df_trabajo = load_and_process_data(sales_file, promo_file)
 
 # ==========================================
 # 4. FILTROS INTERACTIVOS
@@ -95,16 +148,18 @@ df_trabajo = load_and_process_data(sales_csv, promo_csv)
 st.markdown("### 🔍 Filtros de Análisis")
 col_f1, col_f2, col_f3 = st.columns(3)
 
-dptos = ['Todos'] + sorted(df_trabajo['dpto'].dropna().unique().tolist())
+dptos = ['Todos'] + sorted(df_trabajo['dpto'].dropna().unique().tolist()) if 'dpto' in df_trabajo.columns else ['Todos']
 with col_f1:
     sel_dpto = st.selectbox("Departamento", dptos)
 
-mask_dpto = df_trabajo['dpto'] == sel_dpto if sel_dpto != 'Todos' else df_trabajo['dpto'].notna()
-subdptos = ['Todos'] + sorted(df_trabajo[mask_dpto]['subdpto'].dropna().unique().tolist())
+mask_dpto = (df_trabajo['dpto'] == sel_dpto) if sel_dpto != 'Todos' else pd.Series(True, index=df_trabajo.index)
+
+subdptos = ['Todos'] + sorted(df_trabajo[mask_dpto]['subdpto'].dropna().unique().tolist()) if 'subdpto' in df_trabajo.columns else ['Todos']
 with col_f2:
     sel_subdpto = st.selectbox("Subdepartamento", subdptos)
 
-mask_sub = df_trabajo['subdpto'] == sel_subdpto if sel_subdpto != 'Todos' else df_trabajo['subdpto'].notna()
+mask_sub = (df_trabajo['subdpto'] == sel_subdpto) if sel_subdpto != 'Todos' else pd.Series(True, index=df_trabajo.index)
+
 skus = ['Todos'] + sorted(df_trabajo[mask_dpto & mask_sub]['sku'].dropna().unique().tolist())
 with col_f3:
     sel_sku = st.selectbox("SKU", skus)
@@ -192,15 +247,9 @@ else:
             etiquetas_x = [p.split('. ')[1] if '. ' in p else p for p in df_promedios['Periodo']]
             
             fig_3p = go.Figure()
-            fig_3p.add_trace(go.Scatter(x=etiquetas_x, y=df_promedios['unidades'], mode='lines+markers+text', 
-                                        name='Unidades', text=df_promedios['unidades'].round(1), textposition="top center", 
-                                        marker=dict(size=14, color='#3b82f6')))
-            fig_3p.add_trace(go.Scatter(x=etiquetas_x, y=df_promedios['ingresos'], mode='lines+markers+text', 
-                                        name='Ingresos', text=df_promedios['ingresos'].round(1), textposition="bottom center", 
-                                        marker=dict(size=14, color='#10b981')))
-            fig_3p.add_trace(go.Scatter(x=etiquetas_x, y=df_promedios['ganancias'], mode='lines+markers+text', 
-                                        name='Ganancias', text=df_promedios['ganancias'].round(1), textposition="bottom right", 
-                                        marker=dict(size=14, color='#8b5cf6')))
+            fig_3p.add_trace(go.Scatter(x=etiquetas_x, y=df_promedios['unidades'], mode='lines+markers+text', name='Unidades', text=df_promedios['unidades'].round(1), textposition="top center", marker=dict(size=14, color='#3b82f6')))
+            fig_3p.add_trace(go.Scatter(x=etiquetas_x, y=df_promedios['ingresos'], mode='lines+markers+text', name='Ingresos', text=df_promedios['ingresos'].round(1), textposition="bottom center", marker=dict(size=14, color='#10b981')))
+            fig_3p.add_trace(go.Scatter(x=etiquetas_x, y=df_promedios['ganancias'], mode='lines+markers+text', name='Ganancias', text=df_promedios['ganancias'].round(1), textposition="bottom right", marker=dict(size=14, color='#8b5cf6')))
             
             fig_3p.update_layout(template="plotly_dark", plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)')
             st.plotly_chart(fig_3p, use_container_width=True)
@@ -217,35 +266,17 @@ st.markdown("### ✨ Insights Asistidos por IA (Qwen)")
 
 if st.button("Generar Conclusiones de Negocio"):
     with st.spinner("Analizando datos..."):
-        prompt = f"""
-        Actúa como un experto analista de datos de retail. Basado en los siguientes KPIs de un dashboard de promociones: 
-        - Ingresos Totales: ${total_ingresos:,.2f}
-        - Unidades Vendidas: {total_unidades:,.0f}
-        - Porcentaje de días con promoción: {dias_promo_pct:.1f}%
+        prompt = f"Actúa como un experto analista de retail. Basado en estos KPIs: Ingresos ${total_ingresos:,.2f}, Unidades {total_unidades:,.0f}, Promociones {dias_promo_pct:.1f}%. Da conclusiones cortas y consejos."
         
-        Genera una conclusión en español de máximo 2 párrafos sobre el impacto y rentabilidad aparente de las promociones.
-        Da consejos de negocio accionables.
-        """
-        
-        # AQUÍ PON TU API KEY
-        api_key = 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
-        
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json"
-        }
-        
-        payload = {
-            "model": "qwen/qwen-2.5-72b-instruct",
-            "messages": [{"role": "user", "content": prompt}]
-        }
+        api_key = "TU_API_KEY_AQUI" 
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        payload = {"model": "qwen/qwen-2.5-72b-instruct", "messages": [{"role": "user", "content": prompt}]}
         
         try:
             response = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload)
             if response.status_code == 200:
-                insight = response.json()['choices'][0]['message']['content']
-                st.success(insight)
+                st.success(response.json()['choices'][0]['message']['content'])
             else:
-                st.error("Error al comunicarse con la API del LLM. Por favor revisa tu API KEY.")
+                st.error("Error con la API.")
         except Exception as e:
-            st.error(f"Error en la red: {e}")
+            st.error(f"Error de red: {e}")
