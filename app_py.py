@@ -71,12 +71,21 @@ def load_and_process_data(sales_file, promo_file):
     }
     
     # Renombrar columnas si existen
+     # Renombrar columnas si existen
     df_sales = df_sales.rename(columns=columnas_ventas)
+    
+    # Forzar que precio sea numérico antes de hacer cálculos
+    df_sales['precio'] = pd.to_numeric(df_sales['precio'], errors='coerce').fillna(0)
     
     # Manejar el costo si no está explícito pero tenemos 'diferencia_precio_costo'
     if 'costo' not in df_sales.columns and 'diferencia_precio_costo' in df_sales.columns:
-        # Asumimos que precio - costo = diferencia, entonces costo = precio - diferencia
-        df_sales['costo'] = df_sales['precio'] - pd.to_numeric(df_sales['diferencia_precio_costo'], errors='coerce')
+        diferencia = pd.to_numeric(df_sales['diferencia_precio_costo'], errors='coerce').fillna(0)
+        df_sales['costo'] = df_sales['precio'] - diferencia
+    elif 'costo' not in df_sales.columns and 'cruce_costo' in df_sales.columns:
+        df_sales['costo'] = pd.to_numeric(df_sales['cruce_costo'], errors='coerce').fillna(0)
+    elif 'costo' not in df_sales.columns:
+        df_sales['costo'] = 0  # Fallback si no hay nada
+
     elif 'costo' not in df_sales.columns and 'cruce_costo' in df_sales.columns:
         df_sales['costo'] = df_sales['cruce_costo']
     elif 'costo' not in df_sales.columns:
