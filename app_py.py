@@ -69,70 +69,70 @@ def load_and_process_data(sales_file, promo_file):
         'qty': 'unidades_vendidas',
         'precio': 'precio'
     }
-    
-    # Renombrar columnas si existen
-     # Renombrar columnas si existen
     df_sales = df_sales.rename(columns=columnas_ventas)
     
-    # Forzar que precio sea numérico antes de hacer cálculos
+    # Forzar numéricos
     df_sales['precio'] = pd.to_numeric(df_sales['precio'], errors='coerce').fillna(0)
     
-    # Manejar el costo si no está explícito pero tenemos 'diferencia_precio_costo'
+    # Manejar el costo
     if 'costo' not in df_sales.columns and 'diferencia_precio_costo' in df_sales.columns:
         diferencia = pd.to_numeric(df_sales['diferencia_precio_costo'], errors='coerce').fillna(0)
         df_sales['costo'] = df_sales['precio'] - diferencia
     elif 'costo' not in df_sales.columns and 'cruce_costo' in df_sales.columns:
         df_sales['costo'] = pd.to_numeric(df_sales['cruce_costo'], errors='coerce').fillna(0)
     elif 'costo' not in df_sales.columns:
-        df_sales['costo'] = 0  # Fallback si no hay nada
-
-    elif 'costo' not in df_sales.columns and 'cruce_costo' in df_sales.columns:
-        df_sales['costo'] = df_sales['cruce_costo']
-    elif 'costo' not in df_sales.columns:
-        df_sales['costo'] = 0  # Fallback si no hay nada
+        df_sales['costo'] = 0
         
-    # Mapeo de archivo de promociones (asumiendo que las columnas podrían ser parecidas)
-    # Si la base de promos no trae "fecha" sino "tran_date" o "sku" en vez de "prod_nm"
+    # Estandarizar fecha de ventas
+    df_sales['fecha'] = pd.to_datetime(df_sales['fecha'], errors='coerce')
+        
+    # ----------------------------------------------------
+    # MAPEO Y EXPANSIÓN DE ARCHIVO DE PROMOCIONES
+    # ----------------------------------------------------
     columnas_promo = {
-        'tran_date': 'fecha',
-        'prod_nm': 'sku',
-        'promo': 'promo_activa'
+        'fecha_inicio': 'fecha_inicio',
+        'fecha_fin': 'fecha_fin',
+        'sku': 'sku',
+        'flag': 'promo_activa'
     }
     df_promo = df_promo.rename(columns=columnas_promo)
-
-    # Validar que ahora sí existan las obligatorias
-    for col in ['fecha', 'sku']:
-        if col not in df_sales.columns:
-            st.error(f"Error crítico: No se pudo encontrar ni mapear la columna '{col}' en Ventas.")
-            st.stop()
-        if col not in df_promo.columns:
-            st.error(f"Error crítico: No se pudo encontrar ni mapear la columna '{col}' en Promociones.")
-            st.stop()
-            
-    # Estandarizar fechas
-    df_sales['fecha'] = pd.to_datetime(df_sales['fecha'], errors='coerce')
-    df_promo['fecha'] = pd.to_datetime(df_promo['fecha'], errors='coerce')
     
-    # Hacer un left join para cruzar ventas con días de promoción
-    # Si en promo no existe 'promo_activa', la creamos
-    if 'promo_activa' not in df_promo.columns:
-        df_promo['promo_activa'] = 1
+    # Asegurar formato de fechas en promos
+    df_promo['fecha_inicio'] = pd.to_datetime(df_promo['fecha_inicio'], errors='coerce')
+    df_promo['fecha_fin'] = pd.to_datetime(df_promo['fecha_fin'], errors='coerce')
+    
+    # Eliminar filas que no tengan fechas válidas
+    df_promo = df_promo.dropna(subset=['fecha_inicio', 'fecha_fin'])
+    
+    # Expandir rangos de fechas (crear una fila por cada día que dura la promo)
+    df_promo['fecha'] = df_promo.apply(lambda row: pd.date_range(row['fecha_inicio'], row['fecha_fin']), axis=1)
+    df_promo_expanded = df_promo.explode('fecha')
+    
+    # Si no tiene columna que indique que es promo activa, se la ponemos
+    if 'promo_activa' not in df_promo_expanded.columns:
+        df_promo_expanded['promo_activa'] = 1
+    else:
+        # Asegurar que el flag sea numérico (1)
+        df_promo_expanded['promo_activa'] = pd.to_numeric(df_promo_expanded['promo_activa'], errors='coerce').fillna(1)
         
-    df = pd.merge(df_sales, df_promo[['fecha', 'sku', 'promo_activa']].drop_duplicates(), 
+    # ----------------------------------------------------
+    # CRUCE MAESTRO (VENTAS + PROMOCIONES)
+    # ----------------------------------------------------
+    # Cruzamos usando Fecha y SKU
+    df = pd.merge(df_sales, df_promo_expanded[['fecha', 'sku', 'promo_activa']].drop_duplicates(), 
                   on=['fecha', 'sku'], how='left')
     
-    # Limpiar columnas finales
+    # Limpiar métricas finales
     df['promo_activa'] = df['promo_activa'].fillna(0).astype(int)
     df['unidades_vendidas'] = pd.to_numeric(df['unidades_vendidas'], errors='coerce').fillna(0)
-    df['precio'] = pd.to_numeric(df['precio'], errors='coerce').fillna(0)
-    df['costo'] = pd.to_numeric(df['costo'], errors='coerce').fillna(0)
     
-    # Usamos net_sale si está disponible, si no lo calculamos
+    # Calcular ingresos
     if 'net_sale' in df.columns:
         df['ingresos'] = pd.to_numeric(df['net_sale'], errors='coerce').fillna(0)
     else:
         df['ingresos'] = df['unidades_vendidas'] * df['precio']
         
+    # Calcular ganancias
     df['ganancias'] = df['ingresos'] - (df['unidades_vendidas'] * df['costo'])
     
     return df
@@ -289,3 +289,4 @@ if st.button("Generar Conclusiones de Negocio"):
                 st.error("Error con la API.")
         except Exception as e:
             st.error(f"Error de red: {e}")
+
